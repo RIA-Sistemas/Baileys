@@ -141,6 +141,15 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			useClones: false
 		}) as CacheStore)
 
+	// Share the freshly-created cache with peer modules (messages-recv) by mutating
+	// config so they read the same instance. Without this, requestPlaceholderResend
+	// (messages-recv) and processMessage (chats) would write/read independent caches,
+	// breaking PDO response correlation. The Owned flag above stays the source of
+	// truth for cleanup decisions — only the original creator closes on socket end.
+	if (!config.placeholderResendCache) {
+		config.placeholderResendCache = placeholderResendCache
+	}
+
 	/** helper function to fetch the given app state sync key */
 	const getAppStateSyncKey = async (keyId: string) => {
 		const { [keyId]: key } = await authState.keys.get('app-state-sync-key', [keyId])

@@ -1,8 +1,11 @@
 import { jest } from '@jest/globals'
 import P from 'pino'
+import type { BaileysEvent, BaileysEventMap } from '../../Types'
 import { makeEventBuffer } from '../../Utils/event-buffer'
 
 const logger = P({ level: 'silent' })
+
+type AggregatorCallback = (events: Partial<BaileysEventMap>) => void
 
 describe('makeEventBuffer destroy()', () => {
 	beforeEach(() => {
@@ -13,46 +16,60 @@ describe('makeEventBuffer destroy()', () => {
 		jest.useRealTimers()
 	})
 
-	it('clears flushPendingTimeout so a debounced flush does not fire after destroy', () => {
+	it('destroy() clears flushPendingTimeout scheduled by createBufferedFunction', async () => {
+		// flushPendingTimeout is set ONLY in createBufferedFunction's `finally` block
+		// when bufferCount returns to 0 (event-buffer.ts:229-231). Direct buffer()/flush()
+		// never set it. Driving createBufferedFunction is the only realistic test.
 		const buffer = makeEventBuffer(logger)
 
-		// Enter buffering and queue an event so flush scheduling logic runs.
-		buffer.buffer()
-		buffer.emit('connection.update', { connection: 'open' })
+		const wrapped = buffer.createBufferedFunction(async () => 'done')
+		await wrapped()
+		// bufferCount returned to 0 → setTimeout(flush, 100) scheduled (flushPendingTimeout)
+		// AND a separate untracked setTimeout(flush, 100) at line 215 (when bufferCount===1
+		// post-work). The latter is benign (its callback re-checks isBuffering && bufferCount).
 
-		// Trigger a flush() during buffering — the implementation schedules a
-		// debounced re-flush via setTimeout(flush, 100), assigned to flushPendingTimeout.
-		buffer.flush()
+		const timersBeforeDestroy = jest.getTimerCount()
+		expect(timersBeforeDestroy).toBeGreaterThanOrEqual(2)
 
-		// Spy on the listener target to detect any post-destroy flush dispatching.
-		const listener = jest.fn()
-		buffer.on('connection.update', listener)
-
-		// Destroy. Our patch must clear flushPendingTimeout in addition to bufferTimeout.
 		buffer.destroy()
 
-		// Advance past the debounce window. If the timeout was not cleared, flush()
-		// would fire and either throw on torn-down state or re-emit events.
-		jest.advanceTimersByTime(500)
+		// destroy() must clear the TRACKED timers (bufferTimeout + flushPendingTimeout).
+		// At least 1 must be cleared (flushPendingTimeout is the new patch from CR #2191).
+		const timersAfterDestroy = jest.getTimerCount()
+		expect(timersAfterDestroy).toBeLessThan(timersBeforeDestroy)
 
-		// listener was removed by removeAllListeners() inside destroy(); even if the
-		// stray timeout fired, no events should have reached this handler.
-		expect(listener).not.toHaveBeenCalled()
+		// Belt-and-suspenders: any stray untracked timer's callback no-ops because
+		// destroy() reset isBuffering=false. No aggregator emission must occur.
+		const aggregator = jest.fn<AggregatorCallback>()
+		buffer.process(aggregator)
+		jest.advanceTimersByTime(500)
+		expect(aggregator).not.toHaveBeenCalled()
 	})
 
-	it('clears bufferTimeout (regression check for the existing cleanup)', () => {
-		const buffer = makeEventBuffer(logger)
+	it('destroy() clears bufferTimeout scheduled by buffer()', () => {
+		// buffer() schedules bufferTimeout = setTimeout(autoFlush, BUFFER_TIMEOUT_MS=30s)
+		// at event-buffer.ts:101-106. The autoFlush callback logs warn + calls flush().
+		const warnSpy = jest.fn()
+		const localLogger = {
+			...logger,
+			warn: warnSpy,
+			child: () => localLogger
+		} as unknown as Parameters<typeof makeEventBuffer>[0]
+		const buffer = makeEventBuffer(localLogger)
+
 		buffer.buffer()
-		buffer.emit('connection.update', { connection: 'open' })
+		expect(jest.getTimerCount()).toBeGreaterThan(0)
 
-		// Schedule the buffering-window timeout (4500ms in the source).
-		// Then destroy before it fires.
 		buffer.destroy()
+		// Existing destroy() cleanup of bufferTimeout: must reach 0 timers.
+		expect(jest.getTimerCount()).toBe(0)
 
-		const listener = jest.fn()
-		buffer.on('connection.update', listener)
-
-		jest.advanceTimersByTime(10_000)
-		expect(listener).not.toHaveBeenCalled()
+		// Advance 2× BUFFER_TIMEOUT_MS — auto-flush warn must NOT fire.
+		jest.advanceTimersByTime(60_000)
+		expect(warnSpy).not.toHaveBeenCalled()
 	})
 })
+
+// Suppress unused-import lint by type-referencing.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+type _RefBaileysEvent = BaileysEvent

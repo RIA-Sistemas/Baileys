@@ -139,6 +139,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
 			useClones: false
 		})
+	// Note: cache sharing with chats.ts is handled by chats.ts mutating config
+	// at construction (chats.ts wraps socket BEFORE messages-recv via factory order),
+	// so by the time we get here, config.placeholderResendCache is already the
+	// shared instance whenever the caller did not provide their own.
 
 	// Debounce identity-change session refreshes per JID to avoid bursts
 	const identityAssertDebounce = new NodeCache<boolean>({ stdTTL: 5, useClones: false })
